@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+markers = [
+    "compliance: SKILL.md compliance tests using real Claude (expensive)",
+    "e2e: end-to-end integration tests (very expensive)",
+    "slow: tests that take more than 30 seconds",
+]
+testpaths = ["tests"]
