@@ -101,7 +101,8 @@ PHASE_3_STRATEGY_DECOMPOSITION = """\
 
 ## Your Task: Phase 3 — Proof Strategy and Decomposition
 
-Read `proof_work/00_distilled.md` (proposition, hypotheses, definitions).
+The distilled problem (`proof_work/00_distilled.md`) is already loaded in
+your system context above. Use it directly — do not re-read it from disk.
 {survey_context}
 {status_log_context}
 
@@ -120,14 +121,24 @@ Determine and write to `proof_work/00_strategy.md`:
 
 Break the proof into the smallest self-contained claims that chain together to yield the result.
 
+**Numbering convention (REQUIRED):** Number lemmas as `Lemma 1`, `Lemma 2`,
+…, `Lemma N` using consecutive positive integers starting at 1. Do NOT use
+letter labels like `Lemma L1`, `Lemma A`, or `Theorem T`. The final lemma
+`Lemma N` MUST be the main theorem (the original target proposition); every
+preceding lemma is a supporting result that `Lemma N` depends on. The total
+count `N` must equal the value you report as `lemma_count` in the JSON
+summary below.
+
 For each lemma:
 - **Lemma k**: State it precisely with quantifiers.
 - **Depends on**: Which earlier lemmas or hypotheses it requires.
 - **Why needed**: One sentence on how it connects to the main result.
 
-Write a **dependency graph** showing the logical chain.
+Write a **dependency graph** showing the logical chain. The graph must
+terminate at `Lemma N` (the main theorem).
 
-If the proof is simple enough (< 5 logical steps), say so and proceed as a single unit.
+If the proof is simple enough (< 5 logical steps), still produce at least
+one lemma: `Lemma 1` is the main theorem itself, and `lemma_count` is 1.
 
 **Write the decomposition to `proof_work/01_decomposition.md`.**
 
@@ -145,10 +156,14 @@ PHASE_4_PROOF_LEMMA = """\
 ## Your Task: Phase 4 — Prove Lemma {lemma_k}
 
 ### Load context
-- Read `proof_work/00_distilled.md` (hypotheses, definitions).
-- Read `proof_work/00_strategy.md` (proof strategy, known results).
-- Read `proof_work/01_decomposition.md` (lemma statements and dependencies).
-- Read `proof_work/status_log.md` if it exists — use the "Lessons for next iteration" entries to avoid repeating failed strategies.
+The distilled problem, proof strategy, lemma decomposition, and recent
+`status_log.md` entries are ALREADY LOADED in your system context above.
+Do NOT re-read `proof_work/00_distilled.md`, `proof_work/00_strategy.md`,
+`proof_work/01_decomposition.md`, or `proof_work/status_log.md`. Use the
+content from your system context directly.
+
+Use the "Lessons for next iteration" entries from the status log block above
+to avoid repeating failed strategies.
 {dependency_files}
 
 ### Write the proof
@@ -192,11 +207,16 @@ PHASE_5_AUDIT_LEMMA = """\
 You are a hostile mathematical referee. Your job is to find errors in the proof below.
 You have NO context about how or why this proof was written — judge it purely on its own merits.
 
-Read the following files, then run the six-point audit check described below:
-- `proof_work/00_distilled.md` (hypotheses, definitions)
-- `proof_work/00_strategy.md` (proof strategy, known results)
+The distilled problem and proof strategy are ALREADY LOADED in your system
+context above (`<distilled_problem>` and `<proof_strategy>` blocks). Do NOT
+re-read `proof_work/00_distilled.md` or `proof_work/00_strategy.md`. Use the
+system-context content directly.
+
+Read the following files (which are NOT in the system context):
 - `proof_work/proof_lemma_{lemma_k}.md` (the proof to audit)
 {dependency_files}
+
+Then run the six-point audit check described below.
 
 SIX-POINT CHECK:
 1. **Justification audit**: For each step, is the cited justification actually sufficient? Does the cited theorem actually apply given the hypotheses? Check every precondition.
@@ -223,9 +243,11 @@ PHASE_6_GAP_ANALYSIS = """\
 
 ## Your Task: Phase 6 — Gap Analysis for Lemma {lemma_k}
 
-Read:
-- `proof_work/00_distilled.md`
-- `proof_work/00_strategy.md`
+The distilled problem and proof strategy are ALREADY LOADED in your system
+context above. Do NOT re-read `proof_work/00_distilled.md` or
+`proof_work/00_strategy.md`.
+
+Read these files (NOT in the system context):
 - `proof_work/proof_lemma_{lemma_k}.md`
 - `proof_work/audit_lemma_{lemma_k}_iter_{iteration}.md`
 
@@ -254,11 +276,13 @@ PHASE_7_REVISION = """\
 
 ## Your Task: Phase 7 — Revise Lemma {lemma_k}
 
-Read:
+The distilled problem and proof strategy are ALREADY LOADED in your system
+context above. Do NOT re-read `proof_work/00_distilled.md` or
+`proof_work/00_strategy.md`. Use the system-context content directly.
+
+Read these files (NOT in the system context):
 - `proof_work/audit_lemma_{lemma_k}_iter_{iteration}.md`
 - `proof_work/proof_lemma_{lemma_k}.md`
-- `proof_work/00_distilled.md`
-- `proof_work/00_strategy.md`
 {fork_context}
 
 Rewrite affected steps with corrected justifications.
@@ -293,33 +317,20 @@ Return a JSON summary:
 # ---------------------------------------------------------------------------
 # Phase 9 — Cold read assembly (sub-phases a–d)
 # ---------------------------------------------------------------------------
-
-PHASE_9A_COMPILE = """\
-{preamble}
-
-## Your Task: Phase 9a — Compile the proof
-
-Read all `proof_work/proof_lemma_*.md` files in order (by lemma number), WITHOUT reading
-any working notes or audit files. Also read `proof_work/00_distilled.md` and
-`proof_work/00_strategy.md` for context.
-
-Assemble them into a single coherent proof flow. Do not modify the content —
-just read and prepare for the cold read audit.
-
-Write the assembled order to `proof_work/assembled_proof_order.md` listing the
-files read and their lemma numbers.
-
-Return a JSON summary:
-{{"lemma_count": N, "lemma_files": ["list of files in order"]}}
-"""
+#
+# Note: Phase 9a (compile) is now performed in pure Python by
+# orchestrate.py:_compile_assembled_order — it is mechanical file ordering
+# and does not need an LLM call. Phases 9b/9c/9d remain LLM-driven.
 
 PHASE_9B_COLD_READ = """\
 You are a fresh mathematical reviewer performing a cold read of an assembled proof.
 You have NO memory of the proof-writing or per-lemma audit process.
 
-Read:
-- `proof_work/00_distilled.md`
-- `proof_work/00_strategy.md`
+The distilled problem and proof strategy are ALREADY LOADED in your system
+context above. Do NOT re-read `proof_work/00_distilled.md` or
+`proof_work/00_strategy.md`.
+
+Read these files:
 - All `proof_work/proof_lemma_*.md` files in order
 
 Check:
@@ -341,9 +352,11 @@ PHASE_9C_FINAL_PROOF = """\
 
 ## Your Task: Phase 9c — Write the final proof
 
-Read:
-- `proof_work/00_distilled.md`
-- `proof_work/00_strategy.md`
+The distilled problem and proof strategy are ALREADY LOADED in your system
+context above. Do NOT re-read `proof_work/00_distilled.md` or
+`proof_work/00_strategy.md`.
+
+Read these files:
 - All `proof_work/proof_lemma_*.md` files in order
 - `proof_work/cold_read_audit.md`
 

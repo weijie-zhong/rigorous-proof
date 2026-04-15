@@ -38,9 +38,10 @@ When the user asks to prove something:
 5. Detect flags from the user's request:
    - `--max-effort`: if the user said "max effort" (also auto-enabled for difficult problems).
    - `--no-terminal`: if the user said "no terminal" or "run here".
+   - `--parallel N`: if the user said "with N workers" or otherwise wants to override concurrency. Independent lemmas in Phase 4 and Phase 5 run in concurrent waves. **Default is 0 = unlimited** (one worker per lemma in each wave — full parallelism over the dependency DAG). Pass `--parallel 1` to force fully sequential behavior, or `--parallel N` (N ≥ 2) to cap concurrency at N workers per wave.
 6. Launch the orchestrator:
    ```bash
-   python scripts/orchestrate.py [--max-effort] [--no-terminal] [--work-dir DIR]
+   python scripts/orchestrate.py [--max-effort] [--no-terminal] [--parallel N] [--work-dir DIR]
    ```
 7. The orchestrator handles Phases 0–9 automatically.
    - By default, the orchestrator opens a new terminal window (cross-platform: Windows, macOS, Linux) and the Bash call returns immediately. The proof runs independently — it survives even if this chat session stalls.
@@ -446,6 +447,14 @@ python scripts/orchestrate.py --resume
 
 # Specify working directory
 python scripts/orchestrate.py --work-dir /path/to/project
+
+# Default is --parallel 0 = unlimited (one worker per independent lemma per wave)
+
+# Cap concurrency at 4 workers per wave
+python scripts/orchestrate.py --parallel 4
+
+# Force fully sequential lemma proving / auditing (the pre-optimization behavior)
+python scripts/orchestrate.py --parallel 1
 ```
 
 ### Resilience features

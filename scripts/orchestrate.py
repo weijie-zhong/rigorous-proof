@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import random
@@ -62,7 +63,6 @@ from prompts import (
     PHASE_5_AUDIT_LEMMA,
     PHASE_6_GAP_ANALYSIS,
     PHASE_7_REVISION,
-    PHASE_9A_COMPILE,
     PHASE_9B_COLD_READ,
     PHASE_9C_FINAL_PROOF,
     PHASE_9D_JOURNAL,
@@ -70,6 +70,7 @@ from prompts import (
     format_prompt,
     get_dependency_files_text,
 )
+from context import ContextBuilder
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +83,14 @@ FORK_TIMEOUT = 600  # seconds (Phase 6 user input)
 FORK_FAILURE_THRESHOLD = 3  # after N failures, auto-default to A (accept stronger assumption)
 MAX_INNER_ITERATIONS = 7  # Phase 8 inner audit loop cap
 MAX_OUTER_ITERATIONS = 3  # Phase 8 outer re-strategization loop cap
+
+# Default concurrency for Phase 4 (prove) and Phase 5 (audit).
+# 0 is a sentinel meaning "unlimited" — every independent lemma in a
+# dependency-DAG wave runs in its own worker (max_workers = len(wave)).
+# Pass --parallel 1 to force the prior fully sequential behavior, or
+# --parallel N to cap concurrency at N workers per wave.
+PARALLEL_DEFAULT = 0
+PARALLEL_UNLIMITED = 0
 
 # Retry defaults — covers both rate limits (seconds) and usage limits (~5h reset)
 RETRY_MAX_ATTEMPTS = 20          # enough for 5h at ~15 min avg intervals
@@ -110,6 +119,14 @@ def now_iso() -> str:
 # output is unreliable (e.g., CREATE_NEW_CONSOLE windows on some systems).
 _log_file_path: Path | None = None
 
+# Lock that serializes log() calls so parallel workers don't interleave bytes
+# in the console or in the file log.
+_log_lock = threading.Lock()
+
+# Thread-local prefix that parallel workers set (e.g. "[L3] ") so each line
+# from a per-lemma worker is identifiable.
+_log_local = threading.local()
+
 
 def init_log_file(proof_dir: Path) -> None:
     """Enable persistent file logging alongside console output."""
@@ -117,19 +134,30 @@ def init_log_file(proof_dir: Path) -> None:
     _log_file_path = proof_dir / "_orchestrator_console.log"
 
 
+def set_log_prefix(prefix: str | None) -> None:
+    """Set a per-thread prefix prepended to every log line from this thread."""
+    if prefix is None:
+        if hasattr(_log_local, "prefix"):
+            del _log_local.prefix
+    else:
+        _log_local.prefix = prefix
+
+
 def log(msg: str) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
-    line = f"[{timestamp}] {msg}"
-    try:
-        print(line, flush=True)
-    except OSError:
-        pass
-    if _log_file_path:
+    prefix = getattr(_log_local, "prefix", "")
+    line = f"[{timestamp}] {prefix}{msg}"
+    with _log_lock:
         try:
-            with open(_log_file_path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            print(line, flush=True)
         except OSError:
             pass
+        if _log_file_path:
+            try:
+                with open(_log_file_path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError:
+                pass
 
 
 def parse_json_from_output(text: str) -> dict | None:
@@ -173,10 +201,11 @@ def parse_json_from_output(text: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 class OrchestratorState:
-    """Manages proof_work/orchestrator_state.json."""
+    """Manages proof_work/orchestrator_state.json. Thread-safe."""
 
     def __init__(self, proof_dir: Path):
         self.path = proof_dir / "orchestrator_state.json"
+        self._lock = threading.RLock()
         self.data = self._load()
 
     def _load(self) -> dict:
@@ -189,25 +218,44 @@ class OrchestratorState:
         return {}
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(self.data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(self.data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
     def get(self, key: str, default=None):
-        return self.data.get(key, default)
+        with self._lock:
+            return self.data.get(key, default)
 
     def set(self, key: str, value) -> None:
-        self.data[key] = value
-        self.save()
+        with self._lock:
+            self.data[key] = value
+            self.save()
 
     def update_heartbeat(self) -> None:
-        self.data["heartbeat"] = now_iso()
-        self.save()
+        with self._lock:
+            self.data["heartbeat"] = now_iso()
+            self.save()
+
+    def add_concurrent_lemma(self, lemma_k: int) -> None:
+        with self._lock:
+            current = list(self.data.get("concurrent_lemmas", []))
+            if lemma_k not in current:
+                current.append(lemma_k)
+            self.data["concurrent_lemmas"] = sorted(current)
+            self.save()
+
+    def remove_concurrent_lemma(self, lemma_k: int) -> None:
+        with self._lock:
+            current = [k for k in self.data.get("concurrent_lemmas", []) if k != lemma_k]
+            self.data["concurrent_lemmas"] = current
+            self.save()
 
     def is_heartbeat_stale(self) -> bool:
-        hb = self.data.get("heartbeat")
+        with self._lock:
+            hb = self.data.get("heartbeat")
         if not hb:
             return True
         try:
@@ -631,14 +679,20 @@ def prompt_user_fork_decision(gap_summary: str, timeout: int = FORK_TIMEOUT,
 class ProofOrchestrator:
     def __init__(self, work_dir: Path, max_effort: bool = False,
                  max_retries: int = RETRY_MAX_ATTEMPTS,
-                 max_total_wait: float = RETRY_MAX_TOTAL_WAIT):
+                 max_total_wait: float = RETRY_MAX_TOTAL_WAIT,
+                 parallel: int = PARALLEL_DEFAULT):
         self.work_dir = work_dir
         self.proof_dir = work_dir / "proof_work"
         self.max_effort = max_effort
         self.max_retries = max_retries
         self.max_total_wait = max_total_wait
+        # parallel == 0 → unlimited (one worker per lemma in each wave).
+        # parallel == 1 → fully sequential (matches pre-optimization behavior).
+        # parallel >= 2 → cap at N concurrent workers per wave.
+        self.parallel = max(0, int(parallel))
         self.state = OrchestratorState(self.proof_dir)
         self.heartbeat = HeartbeatThread(self.state)
+        self.context = ContextBuilder(self.proof_dir)
         self.lemma_count = 0
 
     def run(self) -> None:
@@ -724,17 +778,21 @@ class ProofOrchestrator:
             lemma_k = 1
             iteration = 1
 
-        self.lemma_count = _count_lemmas(self.proof_dir)
+        # Prefer the count Phase 3 already set from its JSON summary; only
+        # re-parse from the file if Phase 3 didn't populate one. This avoids
+        # losing a valid count when the agent uses non-numeric lemma names
+        # (e.g., "Lemma L1") that _count_lemmas can't match.
+        if not self.lemma_count:
+            self.lemma_count = _count_lemmas(self.proof_dir)
         if self.lemma_count == 0:
             log("Error: could not determine lemma count")
             sys.exit(1)
 
         log(f"Total lemmas: {self.lemma_count}")
 
-        # Phase 4: prove each lemma
+        # Phase 4: prove each lemma (parallelized when --parallel > 1)
         if phase <= 4:
-            for k in range(lemma_k, self.lemma_count + 1):
-                self._run_phase_4(k, iteration)
+            self._run_phase_4_all(start_lemma=lemma_k, iteration=iteration)
             phase = 5
             lemma_k = 1
             iteration = 1
@@ -761,7 +819,18 @@ class ProofOrchestrator:
         self.state.set("phase_status", "done")
 
     def _invoke(self, prompt: str, system_prompt: str | None = None) -> str:
-        """Invoke claude with the orchestrator's working directory."""
+        """
+        Invoke claude with the orchestrator's working directory.
+
+        If no explicit system_prompt is given, the cached ContextBuilder blob
+        is used so Anthropic's prompt cache can hit on repeated calls within
+        the same proof run.
+        """
+        if system_prompt is None:
+            sp = self.context.system_prompt()
+            if not sp.strip():
+                sp = None
+            system_prompt = sp
         return invoke_claude(
             prompt, system_prompt=system_prompt, cwd=self.work_dir,
             max_retries=self.max_retries, max_total_wait=self.max_total_wait,
@@ -1030,6 +1099,11 @@ class ProofOrchestrator:
         else:
             log(f"  → Revision written")
 
+        # Phase 7 may rewrite 00_distilled.md (added hypotheses) and always
+        # appends to status_log.md. Force the next invocation to rebuild the
+        # cached system prompt so the agent sees the latest stable context.
+        self.context.invalidate()
+
         self._mark_done()
 
     # -- Phase 8: Dual loop --
@@ -1059,9 +1133,8 @@ class ProofOrchestrator:
                 # Clear passed lemmas — decomposition changed, all need re-audit
                 self.state.set("passed_lemmas", [])
 
-                # Re-prove all lemmas (Phase 4)
-                for k in range(1, self.lemma_count + 1):
-                    self._run_phase_4(k, 1)
+                # Re-prove all lemmas (Phase 4) — parallel when configured
+                self._run_phase_4_all(start_lemma=1, iteration=1)
 
                 start_lemma = 1
                 start_iteration = 1
@@ -1097,19 +1170,27 @@ class ProofOrchestrator:
 
             all_pass = True
 
+            # Determine which lemmas need auditing this iteration.
+            lemmas_to_audit = [
+                k for k in range(start_lemma, self.lemma_count + 1)
+                if k not in passed_lemmas
+            ]
             for k in range(start_lemma, self.lemma_count + 1):
-                # Skip lemmas that already passed audit
                 if k in passed_lemmas:
                     log(f"  Lemma {k}: already passed — skipping")
-                    continue
 
-                # Phase 5: audit
-                summary = self._run_phase_5(k, iteration)
+            # Phase 5: audit (parallel when --parallel > 1)
+            audit_summaries = self._run_phase_5_all(lemmas_to_audit, iteration)
+
+            # Phase 6/7 sequential per failing lemma — Phase 7 may mutate
+            # 00_distilled.md, and that mutation must be visible to subsequent
+            # revisions in this iteration.
+            for k in lemmas_to_audit:
+                summary = audit_summaries.get(k)
                 has_failures = True  # default to cautious
                 if summary:
                     has_failures = bool(summary.get("failures"))
                 else:
-                    # Check file directly
                     audit_file = self.proof_dir / f"audit_lemma_{k}_iter_{iteration}.md"
                     has_failures = _audit_has_failures(audit_file)
 
@@ -1141,13 +1222,12 @@ class ProofOrchestrator:
     # -- Phase 9: Cold read assembly --
 
     def _run_phase_9(self) -> None:
-        # 9a: compile
-        log("Phase 9a: Compiling proof")
+        # 9a: compile (Python — mechanical file ordering, no LLM needed)
+        log("Phase 9a: Compiling proof (Python)")
         self._set_phase(9, status="in_progress")
 
-        prompt = format_prompt(PHASE_9A_COMPILE)
-        self._invoke(prompt)
-        log("  → Proof compiled")
+        order_file, lemma_files = self._compile_assembled_order()
+        log(f"  → Proof compiled ({len(lemma_files)} lemma files → {order_file.name})")
 
         # 9b: cold read
         log("Phase 9b: Cold read audit")
@@ -1186,6 +1266,178 @@ class ProofOrchestrator:
         self._mark_done()
         self._print_completion()
 
+    # -- Phase 9a Python replacement --
+
+    def _compile_assembled_order(self) -> tuple[Path, list[Path]]:
+        """
+        Replace the LLM Phase 9a call with deterministic file ordering.
+
+        Globs proof_lemma_*.md files in numeric order and writes
+        proof_work/assembled_proof_order.md listing them. Returns
+        (order_file_path, ordered_lemma_files).
+
+        Same output shape as the prior LLM-driven phase, so downstream
+        consumers (Phase 9b/9c/9d, tests) see no semantic difference.
+        """
+        files = list(self.proof_dir.glob("proof_lemma_*.md"))
+        numbered: list[tuple[int, Path]] = []
+        for f in files:
+            m = re.search(r"proof_lemma_(\d+)\.md", f.name)
+            if m:
+                numbered.append((int(m.group(1)), f))
+        numbered.sort(key=lambda t: t[0])
+        ordered_files = [f for _, f in numbered]
+
+        # Detect gaps in lemma numbering (e.g., proof_lemma_3.md missing)
+        if numbered:
+            present = {n for n, _ in numbered}
+            expected = set(range(1, max(present) + 1))
+            missing = sorted(expected - present)
+            if missing:
+                log(f"  ⚠️ Missing lemma proof files: {missing}")
+
+        lines = ["# Assembled Proof Order", ""]
+        lines.append(f"Total lemma files: {len(ordered_files)}")
+        lines.append("")
+        for n, f in numbered:
+            lines.append(f"- Lemma {n}: `proof_work/{f.name}`")
+        lines.append("")
+
+        order_file = self.proof_dir / "assembled_proof_order.md"
+        order_file.write_text("\n".join(lines), encoding="utf-8")
+        return order_file, ordered_files
+
+    # -- Parallel scheduling --
+
+    def _build_dependency_waves(self, lemma_count: int) -> list[list[int]]:
+        """
+        Build topological waves from the lemma dependency graph.
+
+        Wave w contains every lemma whose dependencies are all in waves < w.
+        Lemmas with no in-decomposition dependencies form wave 0.
+        Self-references and forward references are ignored.
+        """
+        deps: dict[int, set[int]] = {}
+        for k in range(1, lemma_count + 1):
+            raw = _parse_lemma_dependencies(self.proof_dir, k)
+            deps[k] = {d for d in raw if 1 <= d <= lemma_count and d != k}
+
+        waves: list[list[int]] = []
+        scheduled: set[int] = set()
+        remaining = set(range(1, lemma_count + 1))
+
+        while remaining:
+            wave = sorted(k for k in remaining if deps[k] <= scheduled)
+            if not wave:
+                # Cycle or unsatisfiable dependencies — fall back to sequential
+                # so we still make progress. Log it once.
+                log(f"  ⚠️ Dependency cycle or unresolved dep among {sorted(remaining)} "
+                    f"— falling back to sequential order")
+                waves.extend([k] for k in sorted(remaining))
+                break
+            waves.append(wave)
+            scheduled.update(wave)
+            remaining.difference_update(wave)
+
+        return waves
+
+    def _run_phase_4_all(self, start_lemma: int, iteration: int = 1) -> None:
+        """
+        Run Phase 4 across all lemmas, parallelized when self.parallel > 1.
+
+        Sequential path (parallel=1): identical to the old per-lemma loop.
+        Parallel path: schedule lemmas in dependency waves, dispatch each
+        wave concurrently with up to self.parallel workers.
+        """
+        if self.parallel == 1:
+            for k in range(start_lemma, self.lemma_count + 1):
+                self._run_phase_4(k, iteration)
+            return
+
+        waves = self._build_dependency_waves(self.lemma_count)
+        # If resuming mid-Phase-4, drop already-completed lemmas from waves.
+        if start_lemma > 1:
+            done = set(range(1, start_lemma))
+            waves = [[k for k in w if k not in done] for w in waves]
+            waves = [w for w in waves if w]
+
+        for wave_idx, wave in enumerate(waves):
+            if len(wave) == 1:
+                self._run_phase_4(wave[0], iteration)
+                continue
+
+            cap_str = "unlimited" if self.parallel == PARALLEL_UNLIMITED \
+                else f"max {self.parallel}"
+            log(f"Phase 4 wave {wave_idx + 1}/{len(waves)}: "
+                f"proving lemmas {wave} in parallel ({cap_str})")
+            self._dispatch_lemma_workers(
+                wave, lambda k: self._run_phase_4(k, iteration)
+            )
+
+    def _run_phase_5_all(self, lemmas_to_audit: list[int],
+                          iteration: int) -> dict[int, dict | None]:
+        """
+        Run Phase 5 audit for the given lemmas, parallelized when self.parallel > 1.
+
+        Returns a dict mapping lemma index → audit JSON summary (or None if
+        the agent didn't return parseable JSON).
+        """
+        results: dict[int, dict | None] = {}
+
+        if self.parallel == 1 or len(lemmas_to_audit) <= 1:
+            for k in lemmas_to_audit:
+                results[k] = self._run_phase_5(k, iteration)
+            return results
+
+        cap_str = "unlimited" if self.parallel == PARALLEL_UNLIMITED \
+            else f"max {self.parallel}"
+        log(f"Phase 5: auditing lemmas {lemmas_to_audit} in parallel ({cap_str})")
+
+        results_lock = threading.Lock()
+
+        def worker(k: int) -> None:
+            summary = self._run_phase_5(k, iteration)
+            with results_lock:
+                results[k] = summary
+
+        self._dispatch_lemma_workers(lemmas_to_audit, worker)
+        return results
+
+    def _dispatch_lemma_workers(self, lemmas: list[int],
+                                  fn) -> None:
+        """
+        Dispatch `fn(lemma_k)` for each lemma concurrently using a thread pool.
+
+        Each worker gets a `[L{k}] ` log prefix. Tracks in-flight lemmas in
+        the state file via add/remove_concurrent_lemma. Re-raises the first
+        worker exception after all workers finish (or fail-fast cancellation
+        if pool is small).
+        """
+        def wrapped(k: int) -> None:
+            set_log_prefix(f"[L{k}] ")
+            self.state.add_concurrent_lemma(k)
+            try:
+                fn(k)
+            finally:
+                self.state.remove_concurrent_lemma(k)
+                set_log_prefix(None)
+
+        if self.parallel == PARALLEL_UNLIMITED:
+            max_workers = len(lemmas)
+        else:
+            max_workers = min(self.parallel, len(lemmas))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(wrapped, k): k for k in lemmas}
+            first_exc: BaseException | None = None
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    fut.result()
+                except BaseException as e:  # noqa: BLE001
+                    if first_exc is None:
+                        first_exc = e
+            if first_exc is not None:
+                raise first_exc
+
     def _print_completion(self) -> None:
         print("\n" + "=" * 60)
         print("  PROOF WORKFLOW COMPLETE")
@@ -1193,16 +1445,32 @@ class ProofOrchestrator:
         print(f"  Final proof:   {self.proof_dir / 'final_proof.md'}")
         print(f"  Proof journal: {self.proof_dir / 'proof_journal.md'}")
 
-        # Check for unresolved gaps
-        cold_read = self.proof_dir / "cold_read_audit.md"
-        if cold_read.exists():
-            text = cold_read.read_text(encoding="utf-8")
-            if "[UNRESOLVED CRITICAL GAP]" in text:
-                print()
-                print("  ⚠️  WARNING: Proof has UNRESOLVED CRITICAL GAPS")
-                print("  See final_proof.md for details")
+        if self._final_proof_has_unresolved_gaps():
+            print()
+            print("  ⚠️  WARNING: Proof has UNRESOLVED CRITICAL GAPS")
+            print("  See final_proof.md for details")
 
         print("=" * 60)
+
+    def _final_proof_has_unresolved_gaps(self) -> bool:
+        """
+        Detect real unresolved gaps in the final proof.
+
+        Phase 9c writes one of two terminators:
+        - clean: ends with `∎`
+        - incomplete: ends with `□ (INCOMPLETE — see unresolved gaps)` and
+          marks each gap inline as `[UNRESOLVED: ...]`.
+
+        We check the final proof — not cold_read_audit.md — because the cold
+        read file contains the literal phrase `[UNRESOLVED CRITICAL GAP]` as
+        part of the rubric instructions even when the cold read passes
+        cleanly. Looking at final_proof.md is unambiguous.
+        """
+        final = self.proof_dir / "final_proof.md"
+        if not final.exists():
+            return False
+        text = final.read_text(encoding="utf-8")
+        return "□ (INCOMPLETE" in text or "[UNRESOLVED:" in text
 
 
 # ---------------------------------------------------------------------------
@@ -1226,6 +1494,9 @@ def _build_extra_args(args) -> list[str]:
         extra.extend(["--max-wait", str(args.max_wait)])
     if args.no_retry:
         extra.append("--no-retry")
+    parallel = getattr(args, "parallel", PARALLEL_DEFAULT)
+    if parallel and parallel != PARALLEL_DEFAULT:
+        extra.extend(["--parallel", str(parallel)])
     return extra
 
 
@@ -1412,6 +1683,16 @@ def main():
         help="Disable automatic retry on rate/usage limit errors",
     )
     parser.add_argument(
+        "--parallel",
+        type=int,
+        default=PARALLEL_DEFAULT,
+        help="Concurrent lemma workers in Phase 4 and Phase 5. "
+             "0 (default) = unlimited: every independent lemma in a "
+             "dependency-DAG wave runs in its own worker. "
+             "1 = fully sequential (the prior pre-optimization behavior). "
+             "N >= 2 = cap concurrency at N workers per wave.",
+    )
+    parser.add_argument(
         "--terminal-mode",
         action="store_true",
         help="Launch in a new terminal window (cross-platform). "
@@ -1437,6 +1718,7 @@ def main():
     orchestrator = ProofOrchestrator(
         work_dir, max_effort=args.max_effort,
         max_retries=max_retries, max_total_wait=args.max_wait,
+        parallel=args.parallel,
     )
     try:
         orchestrator.run()
