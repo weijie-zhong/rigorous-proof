@@ -508,10 +508,23 @@ def invoke_claude(prompt: str, system_prompt: str | None = None,
     with parsed retry-after timing or exponential backoff as fallback.
     Prints the full agent output to stdout so the user can follow along.
     """
+    import tempfile as _tempfile
+
     cmd = ["claude", "-p", "--model", "opus", "--output-format", "json"]
+
+    # Write system prompt to a temp file to avoid Windows command-line
+    # length limits (WinError 206: filename or extension too long).
+    # The temp file is kept alive for the duration of the subprocess call.
+    sp_tmpfile = None
     if system_prompt:
-        cmd.extend(["--append-system-prompt", system_prompt])
-    cmd.append(prompt)
+        sp_tmpfile = _tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", encoding="utf-8", delete=False,
+        )
+        sp_tmpfile.write(system_prompt)
+        sp_tmpfile.close()
+        cmd.extend(["--append-system-prompt-file", sp_tmpfile.name])
+
+    # Pass prompt via stdin to avoid the same length limit.
 
     log(f"Invoking claude ({len(prompt)} chars prompt)...")
 
@@ -523,14 +536,15 @@ def invoke_claude(prompt: str, system_prompt: str | None = None,
     if sys.platform == "win32":
         extra_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-    for attempt in range(1 + max_retries):
+    try:
+      for attempt in range(1 + max_retries):
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
             cwd=cwd,
-            stdin=subprocess.DEVNULL,
+            input=prompt,
             **extra_kwargs,
         )
 
@@ -605,6 +619,15 @@ def invoke_claude(prompt: str, system_prompt: str | None = None,
                 else:
                     rem_str = f"{remaining:.0f}s"
                 log(f"    ... {rem_str} remaining until next retry")
+
+    finally:
+        # Clean up temp file for system prompt
+        if sp_tmpfile is not None:
+            try:
+                import os as _os
+                _os.unlink(sp_tmpfile.name)
+            except OSError:
+                pass
 
     output = result.stdout.strip()
 
