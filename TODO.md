@@ -12,3 +12,7 @@ When a lemma has fully passed the audit, mark it as pass, no need to audit it in
 
 # 3. Fork logic
 Add logging so that if a lemma failed 3 times, the default option (when user does not respond) is to accept stronger assumption.
+
+================Above Done=======================
+1. Fork logic — DONE
+2. Code review for speed/token optimization — DONE

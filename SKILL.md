@@ -215,18 +215,30 @@ When a ❌ is found that cannot be fixed by simple revision:
 - **Crucial**: A gap that requires an assumption not present in the hypotheses → proceed to 6b.
 - **Fatal**: The proposition as stated may be false or unprovable from the given hypotheses → report to user.
 
-### 6b. Fork: Explore stronger assumptions
+### 6b. Fork: PI reviewer with free-form user input
+
 For each **crucial** gap, create a file `proof_work/fork_lemma_k_gap_j.md` containing the gap analysis.
 
-**Present fork options:**
-- (A) Accept the stronger assumption and continue
-- (B) Try the alternative proof strategy **(default if no response, unless failure threshold reached)**
-- (C) Prove the weaker conclusion instead
-- (D) Abandon this lemma and restructure
+**Free-form user input.** The user is shown the gap and asked to type free-form guidance ("try contradiction", "accept that f is C^1", "this is wrong, restructure", etc.). They are NOT forced to pick A/B/C/D.
 
-**Timeout:** Wait up to 600 seconds (10 minutes) for user input. If no response, automatically select the default option. Log the auto-selection with a note.
+**Timeout → PI reviewer agent.** Wait up to 600 seconds for user input. If no response (or empty input), the orchestrator escalates to a **PI reviewer agent** that:
 
-**Failure escalation:** The orchestrator tracks how many times each lemma has failed audit. After **3 failures** on the same lemma, the default auto-selection changes from **(B)** to **(A)** (accept stronger assumption). This is logged: `Decision: A (auto-selected after 600s timeout, default changed to A after 3 failures)`. The rationale is that repeated failures suggest the original hypotheses are genuinely insufficient, and accepting a stronger assumption is more productive than continuing to retry.
+- Reads `proof_work/proof_lemma_k.md`, `proof_work/audit_lemma_k_iter_n.md`, all relevant fork files, and `proof_work/decision_log.md` (running history of every prior decision in this proof run).
+- Honestly evaluates the proof's status — including the option to propose a **complete overhaul** of the proof structure (rewinding to Phase 3 to re-strategize and re-decompose).
+- Returns a structured decision: `retry_current`, `accept_assumption` (with the **minimal** new hypothesis), `weaker_conclusion`, `rewind_to_strategy`, or `abandon`.
+
+The reviewer call uses the same retry budget (~5h) as the main orchestrator, so transient rate limits do not derail the decision.
+
+**Decision log.** Every reviewer decision is appended to `proof_work/decision_log.md` (action, reasoning, user input, assumption text, concise summary). Future reviewer calls read this file so they don't propose actions that have already been tried and failed.
+
+**Priority guidance based on failure count:**
+
+- **Failures ≤ 5**: priority is `retry_current` — try a different proof approach for the existing proposition before strengthening hypotheses.
+- **Failures > 5**: priority is `accept_assumption` — repeated retries are unlikely to converge; prefer the minimal hypothesis that closes the gap, unless rewinding is clearly warranted.
+
+The reviewer can override the priority when the decision log shows the priority action has already been tried and failed.
+
+**Rewind semantics.** A `rewind_to_strategy` decision raises out of the inner loop and re-enters Phase 3 (re-strategize + re-decompose). If the run was not started with `--max-effort`, the orchestrator auto-promotes to max_effort so the outer loop can run — the reviewer has full PI authority and a structural rethink trumps the default single-pass mode.
 
 ---
 
@@ -461,7 +473,7 @@ python scripts/orchestrate.py --parallel 1
 
 - **Heartbeat**: The orchestrator writes a heartbeat every 30 seconds. On resume, if the heartbeat is stale (>120s) and a phase was in progress, it restarts that phase.
 - **File-based state**: Progress is tracked in `proof_work/orchestrator_state.json` and can also be inferred from the proof files themselves.
-- **No per-phase timeouts**: The orchestrator waits for each agent to finish — only Phase 6 (fork decision) has a 600-second timeout for user input, defaulting to option B (or A after 3 failures — see Phase 6).
+- **No per-phase timeouts**: The orchestrator waits for each agent to finish — only Phase 6 has a 600-second timeout for user input. On timeout the PI reviewer agent (with the same ~5h retry budget as the main orchestrator) decides on the user's behalf — see Phase 6 for the priority semantics and rewind authority.
 - **Resume from anywhere**: Run `--resume` after any disruption to pick up where it left off.
 
 ---

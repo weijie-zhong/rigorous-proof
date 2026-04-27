@@ -809,3 +809,195 @@ class TestAutoDetectDifficulty:
         difficulty = orch._get_difficulty()
         assert difficulty == "moderate"
         assert orch.max_effort is False
+
+
+# ===== 7.0 PI reviewer agent =====
+
+from orchestrate import (
+    REVIEWER_RETRY_THRESHOLD,
+    REVIEWER_ACTIONS,
+    RewindRequested,
+    prompt_user_freeform,
+    _REVIEWER_ACTION_TO_LEGACY_CHOICE,
+)
+
+
+class TestReviewerFreeformInput:
+    def test_freeform_timeout_returns_none(self):
+        """No user input within timeout → None (escalate to reviewer)."""
+        result = prompt_user_freeform("test gap", timeout=1)
+        assert result is None
+
+
+class TestReviewerInvocation:
+    def _make_orch(self, tmp_path):
+        proof_dir = tmp_path / "proof_work"
+        proof_dir.mkdir()
+        (proof_dir / "00_distilled.md").write_text("# test", encoding="utf-8")
+        return ProofOrchestrator(tmp_path, max_effort=True)
+
+    def test_reviewer_below_threshold_priority_is_retry(self, tmp_path):
+        """At failure_count <= 5, reviewer prompt should prefer retry_current."""
+        orch = self._make_orch(tmp_path)
+        captured = {}
+
+        def fake_invoke(prompt, system_prompt=None, **_):
+            captured["prompt"] = prompt
+            return ('{"action": "retry_current", "reasoning": "ok", '
+                    '"assumption_or_target": "", '
+                    '"guidance_for_next_phase": "try contradiction", '
+                    '"log_entry": "tried direct"}')
+
+        with patch.object(orch, "_invoke", side_effect=fake_invoke):
+            decision = orch._invoke_reviewer(
+                lemma_k=2, iteration=3, failure_count=2, user_input=None)
+
+        assert decision["action"] == "retry_current"
+        assert "retry_current" in captured["prompt"]
+        # Priority text must mention retry_current as the priority
+        assert "priority is **retry_current**" in captured["prompt"] \
+            or "**retry_current**" in captured["prompt"]
+
+    def test_reviewer_above_threshold_priority_is_accept(self, tmp_path):
+        """Above failure threshold, reviewer prompt prefers accept_assumption."""
+        orch = self._make_orch(tmp_path)
+        captured = {}
+
+        def fake_invoke(prompt, system_prompt=None, **_):
+            captured["prompt"] = prompt
+            return ('{"action": "accept_assumption", '
+                    '"reasoning": "exhausted retries", '
+                    '"assumption_or_target": "f is C^1", '
+                    '"guidance_for_next_phase": "use f C^1", '
+                    '"log_entry": "accepted f C^1"}')
+
+        with patch.object(orch, "_invoke", side_effect=fake_invoke):
+            decision = orch._invoke_reviewer(
+                lemma_k=1, iteration=4,
+                failure_count=REVIEWER_RETRY_THRESHOLD + 1,
+                user_input="please accept what's needed")
+
+        assert decision["action"] == "accept_assumption"
+        assert "accept_assumption" in captured["prompt"]
+        assert "please accept what's needed" in captured["prompt"]
+
+    def test_reviewer_invalid_action_falls_back_to_priority(self, tmp_path):
+        """Invalid reviewer JSON action → fall back to priority action."""
+        orch = self._make_orch(tmp_path)
+
+        def fake_invoke(prompt, system_prompt=None, **_):
+            return '{"action": "do_something_weird", "reasoning": "x"}'
+
+        with patch.object(orch, "_invoke", side_effect=fake_invoke):
+            decision = orch._invoke_reviewer(
+                lemma_k=1, iteration=1, failure_count=1, user_input=None)
+        # failure_count <= threshold → priority is retry_current
+        assert decision["action"] == "retry_current"
+
+    def test_action_legacy_mapping_covers_all_actions(self):
+        """Every reviewer action must map to a legacy choice letter."""
+        for action in REVIEWER_ACTIONS:
+            assert action in _REVIEWER_ACTION_TO_LEGACY_CHOICE
+
+
+class TestDecisionLog:
+    def test_decision_log_appends_entries(self, tmp_path):
+        """Each call appends a new entry; the file persists across calls."""
+        proof_dir = tmp_path / "proof_work"
+        proof_dir.mkdir()
+        (proof_dir / "00_distilled.md").write_text("# d", encoding="utf-8")
+        orch = ProofOrchestrator(tmp_path, max_effort=True)
+
+        decision1 = {
+            "action": "retry_current",
+            "reasoning": "give it another shot",
+            "assumption_or_target": "",
+            "guidance_for_next_phase": "try contradiction",
+            "log_entry": "tried direct, switching to contradiction",
+        }
+        decision2 = {
+            "action": "accept_assumption",
+            "reasoning": "exhausted retries",
+            "assumption_or_target": "f is differentiable",
+            "guidance_for_next_phase": "use f differentiable",
+            "log_entry": "accepted f differentiable to close gap j",
+        }
+
+        orch._append_decision_log(
+            lemma_k=2, iteration=1, failure_count=1,
+            user_input="try harder", decision=decision1,
+        )
+        orch._append_decision_log(
+            lemma_k=2, iteration=2, failure_count=2,
+            user_input=None, decision=decision2,
+        )
+
+        text = (proof_dir / "decision_log.md").read_text(encoding="utf-8")
+        assert "# Decision Log" in text
+        assert "retry_current" in text
+        assert "accept_assumption" in text
+        assert "try harder" in text  # user input recorded
+        assert "f is differentiable" in text  # assumption recorded
+        # Both entries present
+        assert text.count("Lemma 2, iter") == 2
+
+
+class TestRewindFlow:
+    def test_rewind_requested_carries_target_and_reason(self):
+        rw = RewindRequested("strategy", "fundamental gap")
+        assert rw.target == "strategy"
+        assert rw.reasoning == "fundamental gap"
+
+    def test_reviewer_rewind_raises_in_phase_6(self, tmp_path,
+                                                  proof_dir_at_phase):
+        """When reviewer returns rewind_to_strategy, _run_phase_6 raises."""
+        d = proof_dir_at_phase(phase=6, audit_result="fail")
+
+        def fake_invoke(prompt, system_prompt=None, **_):
+            # Phase 6 gap-analysis call: report a crucial gap
+            if "Gap Analysis" in prompt:
+                return ('{"lemma": 1, "fixable": 0, "crucial": 1, '
+                        '"fatal": 0, "fork_files": []}')
+            # Reviewer call: request rewind
+            if "Principal Investigator" in prompt or "reviewer" in prompt.lower():
+                return ('{"action": "rewind_to_strategy", '
+                        '"reasoning": "decomposition is wrong", '
+                        '"assumption_or_target": "", '
+                        '"guidance_for_next_phase": "split lemma 1 differently", '
+                        '"log_entry": "structural rewind requested"}')
+            return '{}'
+
+        orch = ProofOrchestrator(d.parent, max_effort=True)
+        with patch.object(orch, "_invoke", side_effect=fake_invoke):
+            with pytest.raises(RewindRequested) as excinfo:
+                orch._run_phase_6(lemma_k=1, iteration=1)
+        assert excinfo.value.target == "strategy"
+
+    def test_dual_loop_promotes_max_effort_on_rewind(self, tmp_path,
+                                                        proof_dir_at_phase):
+        """A rewind in non-max-effort mode auto-promotes max_effort."""
+        d = proof_dir_at_phase(phase=5)
+        orch = ProofOrchestrator(d.parent, max_effort=False)
+        orch.lemma_count = 2
+
+        # Simulate the rewind catch path manually: max_effort starts False,
+        # the dual loop must promote it before re-running outer iterations.
+        # We invoke a stripped-down dual-loop scenario by calling the catch
+        # block logic via patching _run_inner_audit_loop.
+        calls = {"inner": 0}
+
+        def fake_inner(start_lemma, start_iteration):
+            calls["inner"] += 1
+            if calls["inner"] == 1:
+                raise RewindRequested("strategy", "rethink needed")
+            return True  # second call passes
+
+        # _run_dual_loop's outer == 0 path skips Phase 3, so we patch out
+        # the re-strategize step to make the test self-contained.
+        with patch.object(orch, "_run_inner_audit_loop", side_effect=fake_inner), \
+             patch.object(orch, "_run_phase_3"), \
+             patch.object(orch, "_run_phase_4_all"):
+            orch._run_dual_loop(start_lemma=1, start_iteration=1)
+
+        assert orch.max_effort is True, "rewind should auto-promote max_effort"
+        assert calls["inner"] >= 2, "outer loop should retry after rewind"

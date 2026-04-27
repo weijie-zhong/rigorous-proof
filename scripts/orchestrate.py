@@ -62,6 +62,7 @@ from prompts import (
     PHASE_4_PROOF_LEMMA,
     PHASE_5_AUDIT_LEMMA,
     PHASE_6_GAP_ANALYSIS,
+    PHASE_6_REVIEWER,
     PHASE_7_REVISION,
     PHASE_9B_COLD_READ,
     PHASE_9C_FINAL_PROOF,
@@ -80,7 +81,8 @@ from context import ContextBuilder
 HEARTBEAT_INTERVAL = 30  # seconds
 HEARTBEAT_STALE_THRESHOLD = 120  # seconds
 FORK_TIMEOUT = 600  # seconds (Phase 6 user input)
-FORK_FAILURE_THRESHOLD = 3  # after N failures, auto-default to A (accept stronger assumption)
+FORK_FAILURE_THRESHOLD = 3  # after N failures, default the reviewer prompt prefers accept_assumption
+REVIEWER_RETRY_THRESHOLD = 5  # failures ≤ this → reviewer's priority is retry_current; > this → priority is accept_assumption
 MAX_INNER_ITERATIONS = 7  # Phase 8 inner audit loop cap
 MAX_OUTER_ITERATIONS = 3  # Phase 8 outer re-strategization loop cap
 
@@ -160,6 +162,10 @@ def log(msg: str) -> None:
                 pass
 
 
+_JSON_FENCE_RE = re.compile(r"```json\s*\n(.*?)\n\s*```", re.DOTALL)
+_JSON_BRACE_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
+
 def parse_json_from_output(text: str) -> dict | None:
     """Try to extract a JSON object from Claude's output."""
     # Look for JSON in the result field of --output-format json
@@ -178,7 +184,7 @@ def parse_json_from_output(text: str) -> dict | None:
         pass
 
     # Look for ```json blocks
-    match = re.search(r"```json\s*\n(.*?)\n\s*```", text, re.DOTALL)
+    match = _JSON_FENCE_RE.search(text)
     if match:
         try:
             return json.loads(match.group(1))
@@ -186,7 +192,7 @@ def parse_json_from_output(text: str) -> dict | None:
             pass
 
     # Look for any { ... } block
-    match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+    match = _JSON_BRACE_RE.search(text)
     if match:
         try:
             return json.loads(match.group(0))
@@ -695,6 +701,88 @@ def prompt_user_fork_decision(gap_summary: str, timeout: int = FORK_TIMEOUT,
     return (result["choice"], False)
 
 
+def prompt_user_freeform(gap_summary: str,
+                          timeout: int = FORK_TIMEOUT) -> str | None:
+    """
+    Present the gap to the user and wait up to *timeout* seconds for free-form
+    text guidance. Empty/whitespace-only input is treated as no response.
+    Returns the user's text, or None on timeout / empty input.
+
+    The text is forwarded to the PI reviewer agent, which decides the next
+    structured action. The user does NOT need to pick A/B/C/D — they describe
+    in their own words how they want the proof to proceed.
+    """
+    print("\n" + "=" * 60)
+    print("FORK DECISION REQUIRED — free-form input")
+    print("=" * 60)
+    print(gap_summary)
+    print()
+    print(f"You have {timeout} seconds to type guidance for the PI reviewer.")
+    print("Examples: 'try contradiction instead', 'accept that f is C^1',")
+    print("          'this lemma is wrong, restructure', or just press Enter")
+    print("          to let the reviewer decide on its own.")
+    print()
+
+    result = {"text": None}
+
+    def read_input():
+        try:
+            text = input("Your guidance > ")
+            result["text"] = text
+        except EOFError:
+            pass
+
+    thread = threading.Thread(target=read_input, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if result["text"] is None:
+        log(f"No response after {timeout}s — escalating to PI reviewer agent")
+        return None
+
+    text = result["text"].strip()
+    if not text:
+        log("Empty user input — escalating to PI reviewer agent")
+        return None
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Rewind signal — raised by Phase 6 when the reviewer agent decides the
+# proof structure itself needs a re-think. Caught by the outer loop, which
+# then re-enters Phase 3 (re-strategize + re-decompose).
+# ---------------------------------------------------------------------------
+
+class RewindRequested(Exception):
+    """Reviewer requested rewinding to an earlier phase."""
+
+    def __init__(self, target: str, reasoning: str):
+        super().__init__(f"Rewind to {target}: {reasoning}")
+        self.target = target  # currently always "strategy"
+        self.reasoning = reasoning
+
+
+# Valid actions the reviewer can return
+REVIEWER_ACTIONS = (
+    "retry_current",
+    "accept_assumption",
+    "weaker_conclusion",
+    "rewind_to_strategy",
+    "abandon",
+)
+
+
+# Map reviewer actions back to the legacy A/B/C/D fork choices so that any
+# downstream consumer (state file, journal) keeps working without churn.
+_REVIEWER_ACTION_TO_LEGACY_CHOICE = {
+    "accept_assumption": "A",
+    "retry_current": "B",
+    "weaker_conclusion": "C",
+    "abandon": "D",
+    "rewind_to_strategy": "R",
+}
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -1017,10 +1105,17 @@ class ProofOrchestrator:
         self._mark_done()
         return summary
 
-    # -- Phase 6: Gap resolution --
+    # -- Phase 6: Gap resolution + PI reviewer --
 
-    def _run_phase_6(self, lemma_k: int, iteration: int) -> str | None:
-        """Run gap analysis and prompt user for fork decision. Returns chosen option."""
+    def _run_phase_6(self, lemma_k: int, iteration: int) -> dict | None:
+        """
+        Run gap analysis, then ask the user for free-form guidance and
+        escalate to the PI reviewer agent. Returns the reviewer's structured
+        decision dict, or None if no crucial gap was found.
+
+        May raise RewindRequested when the reviewer chooses
+        `rewind_to_strategy` — caught by the outer loop.
+        """
         log(f"Phase 6: Gap Resolution for Lemma {lemma_k}")
         self._set_phase(6, lemma_k, iteration)
 
@@ -1030,8 +1125,8 @@ class ProofOrchestrator:
         prev_count = lemma_failures.get(fail_key, 0)
         lemma_failures[fail_key] = prev_count + 1
         self.state.set("lemma_failure_counts", lemma_failures)
-
-        log(f"  Failure count for Lemma {lemma_k}: {lemma_failures[fail_key]}")
+        current_failures = lemma_failures[fail_key]
+        log(f"  Failure count for Lemma {lemma_k}: {current_failures}")
 
         prompt = format_prompt(
             PHASE_6_GAP_ANALYSIS,
@@ -1050,38 +1145,148 @@ class ProofOrchestrator:
 
         self._mark_done()
 
-        # If there are crucial gaps, prompt user for fork decision
-        if crucial > 0:
-            gap_text = self._read_fork_summaries(lemma_k)
+        if crucial <= 0:
+            return None
 
-            # After FORK_FAILURE_THRESHOLD failures, default to A (accept stronger assumption)
-            current_failures = lemma_failures[fail_key]
-            if current_failures >= FORK_FAILURE_THRESHOLD:
-                fork_default = "A"
-                log(f"  ⚠️ Lemma {lemma_k} failed {current_failures} times "
-                    f"(≥ {FORK_FAILURE_THRESHOLD}) — defaulting to A (accept stronger assumption)")
-            else:
-                fork_default = "B"
+        # Free-form user input → reviewer agent
+        gap_text = self._read_fork_summaries(lemma_k)
+        user_input = prompt_user_freeform(gap_text, timeout=FORK_TIMEOUT)
+        decision = self._invoke_reviewer(
+            lemma_k=lemma_k,
+            iteration=iteration,
+            failure_count=current_failures,
+            user_input=user_input,
+        )
 
-            choice, was_auto = prompt_user_fork_decision(
-                gap_text, default=fork_default)
+        # Persist decision
+        action = decision["action"]
+        legacy_choice = _REVIEWER_ACTION_TO_LEGACY_CHOICE.get(action, "?")
+        fork_decisions = self.state.get("fork_decisions", {})
+        fork_decisions[str(lemma_k)] = {
+            "choice": legacy_choice,
+            "action": action,
+            "reasoning": decision.get("reasoning", ""),
+            "assumption_or_target": decision.get("assumption_or_target", ""),
+            "guidance_for_next_phase": decision.get("guidance_for_next_phase", ""),
+            "user_input": user_input or "",
+            "failure_count": current_failures,
+        }
+        self.state.set("fork_decisions", fork_decisions)
+        self._append_decision_log(lemma_k, iteration, current_failures,
+                                    user_input, decision)
+        log(f"  → Reviewer decision for Lemma {lemma_k}: {action}")
 
-            decision_note = f"Decision: {choice}"
-            if was_auto:
-                decision_note += f" (auto-selected after {FORK_TIMEOUT}s timeout"
-                if current_failures >= FORK_FAILURE_THRESHOLD:
-                    decision_note += f", default changed to A after {current_failures} failures"
-                decision_note += ")"
+        if action == "rewind_to_strategy":
+            raise RewindRequested("strategy", decision.get("reasoning", ""))
 
-            # Record decision in state
-            fork_decisions = self.state.get("fork_decisions", {})
-            fork_decisions[str(lemma_k)] = {"choice": choice, "note": decision_note}
-            self.state.set("fork_decisions", fork_decisions)
+        return decision
 
-            log(f"  → Fork decision for Lemma {lemma_k}: {choice}")
-            return choice
+    def _invoke_reviewer(self, lemma_k: int, iteration: int,
+                          failure_count: int,
+                          user_input: str | None) -> dict:
+        """
+        Call the PI reviewer agent with full context. Reuses invoke_claude's
+        retry logic, so transient rate-limit errors are handled the same way
+        as the main proof phases (full ~5h retry budget).
+        """
+        if failure_count <= REVIEWER_RETRY_THRESHOLD:
+            priority_action = "retry_current"
+            priority_explanation = (
+                "Prefer trying a different proof approach for the existing "
+                "proposition; assumption-strengthening should be a last "
+                "resort while we still have retry budget."
+            )
+        else:
+            priority_action = "accept_assumption"
+            priority_explanation = (
+                f"After {failure_count} failures, repeated retries on the "
+                "current proposition are unlikely to converge. Prefer the "
+                "minimal assumption that closes the gap, unless rewinding "
+                "the entire strategy is clearly warranted."
+            )
 
-        return None
+        if user_input:
+            user_input_block = f"\n```\n{user_input}\n```\n"
+        else:
+            user_input_block = (
+                "(no response — the user wants you to decide on their behalf)"
+            )
+
+        prompt = format_prompt(
+            PHASE_6_REVIEWER,
+            lemma_k=lemma_k,
+            iteration=iteration,
+            failure_count=failure_count,
+            timeout=FORK_TIMEOUT,
+            user_input_block=user_input_block,
+            retry_threshold=REVIEWER_RETRY_THRESHOLD,
+            priority_action=priority_action,
+            priority_explanation=priority_explanation,
+        )
+
+        output = self._invoke(prompt)
+        decision = parse_json_from_output(output) or {}
+
+        # Validate / normalize
+        action = decision.get("action", "")
+        if action not in REVIEWER_ACTIONS:
+            log(f"  ⚠️ Reviewer returned invalid action {action!r}; "
+                f"falling back to {priority_action}")
+            decision = {
+                "action": priority_action,
+                "reasoning": (decision.get("reasoning")
+                              or "Reviewer output unparseable; using priority default."),
+                "assumption_or_target": decision.get("assumption_or_target", ""),
+                "guidance_for_next_phase": decision.get(
+                    "guidance_for_next_phase",
+                    "No reviewer guidance available — use status_log lessons.",
+                ),
+                "log_entry": decision.get(
+                    "log_entry",
+                    f"Reviewer output invalid; defaulted to {priority_action}.",
+                ),
+            }
+        return decision
+
+    def _append_decision_log(self, lemma_k: int, iteration: int,
+                              failure_count: int, user_input: str | None,
+                              decision: dict) -> None:
+        """
+        Append a concise entry to proof_work/decision_log.md. Future
+        reviewer calls read this file as context, so they can avoid
+        proposing actions that have already been tried and failed.
+        """
+        log_path = self.proof_dir / "decision_log.md"
+        if not log_path.exists():
+            header = ("# Decision Log\n\n"
+                     "Running history of every PI-reviewer decision in this "
+                     "proof run. Each entry is the reviewer's own concise "
+                     "summary; downstream agents read this file to avoid "
+                     "repeating failed actions.\n")
+            log_path.write_text(header, encoding="utf-8")
+
+        ts = now_iso()
+        action = decision.get("action", "?")
+        log_entry = decision.get("log_entry", "").strip()
+        reasoning = decision.get("reasoning", "").strip()
+        user_text = (user_input or "(no user input — auto)").strip()
+        assumption = decision.get("assumption_or_target", "").strip()
+
+        entry = [
+            f"\n## {ts} — Lemma {lemma_k}, iter {iteration}, failure #{failure_count}",
+            f"- Action: **{action}**",
+            f"- User input: {user_text}",
+        ]
+        if assumption:
+            entry.append(f"- Assumption / target: {assumption}")
+        if reasoning:
+            entry.append(f"- Reasoning: {reasoning}")
+        if log_entry:
+            entry.append(f"- Summary: {log_entry}")
+        entry.append("")
+
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(entry))
 
     def _read_fork_summaries(self, lemma_k: int) -> str:
         """Read fork analysis files for display to user."""
@@ -1101,10 +1306,30 @@ class ProofOrchestrator:
         fork_ctx = ""
         if str(lemma_k) in fork_decisions:
             decision = fork_decisions[str(lemma_k)]
-            fork_ctx = (
-                f"- Fork decision: {decision['choice']}. "
-                f"Read fork files: proof_work/fork_lemma_{lemma_k}_gap_*.md"
+            action = decision.get("action") or decision.get("choice", "?")
+            parts = [f"- Reviewer decision: **{action}**"]
+            if decision.get("reasoning"):
+                parts.append(f"- Reviewer reasoning: {decision['reasoning']}")
+            if decision.get("assumption_or_target"):
+                parts.append(
+                    f"- Assumption / target text: {decision['assumption_or_target']}"
+                )
+            if decision.get("guidance_for_next_phase"):
+                parts.append(
+                    f"- Guidance for this revision: "
+                    f"{decision['guidance_for_next_phase']}"
+                )
+            if decision.get("user_input"):
+                parts.append(f"- User input: {decision['user_input']}")
+            parts.append(
+                f"- Read fork files: proof_work/fork_lemma_{lemma_k}_gap_*.md"
             )
+            parts.append(
+                "- Read `proof_work/decision_log.md` for prior decisions on "
+                "this and other lemmas — avoid retrying anything already "
+                "logged as failed."
+            )
+            fork_ctx = "\n".join(parts)
 
         prompt = format_prompt(
             PHASE_7_REVISION,
@@ -1135,12 +1360,19 @@ class ProofOrchestrator:
         """
         Phase 8: Dual loop architecture.
         Inner loop: per-lemma audit→gap→revision (phases 5-7), max MAX_INNER_ITERATIONS.
-        Outer loop: if inner loop exhausts, go back to Phase 3 to re-strategize,
-                     re-decompose, and re-prove. Max MAX_OUTER_ITERATIONS.
+        Outer loop: if inner loop exhausts (or the PI reviewer requests a
+        rewind), go back to Phase 3 to re-strategize, re-decompose, and
+        re-prove. Max MAX_OUTER_ITERATIONS.
+
+        A reviewer-triggered rewind also auto-promotes max_effort so the
+        outer loop can run even when the user did not request --max-effort
+        — the reviewer has full PI authority to decide a structural rethink
+        is necessary.
         """
         max_outer = MAX_OUTER_ITERATIONS if self.max_effort else 1
 
-        for outer in range(max_outer):
+        outer = 0
+        while outer < max_outer:
             if outer > 0:
                 log(f"\n{'='*60}")
                 log(f"OUTER LOOP: Re-strategization attempt {outer + 1} / {max_outer}")
@@ -1162,14 +1394,29 @@ class ProofOrchestrator:
                 start_lemma = 1
                 start_iteration = 1
 
-            all_pass = self._run_inner_audit_loop(start_lemma, start_iteration)
+            try:
+                all_pass = self._run_inner_audit_loop(start_lemma, start_iteration)
+            except RewindRequested as rw:
+                log(f"\n🔄 Reviewer requested rewind to {rw.target}: {rw.reasoning}")
+                if not self.max_effort:
+                    log("  Auto-promoting to max_effort so the outer loop can honor the rewind")
+                    self.max_effort = True
+                    self.state.set("max_effort", True)
+                    max_outer = MAX_OUTER_ITERATIONS
+                # Force the next outer iteration to re-strategize from scratch
+                outer += 1
+                start_lemma = 1
+                start_iteration = 1
+                continue
 
             if all_pass:
-                break
-        else:
-            if max_outer > 1:
-                log(f"\n⚠️ {max_outer} outer iterations exhausted with remaining failures")
-                log("Proceeding to Phase 9 with honest reporting of remaining gaps")
+                return
+
+            outer += 1
+
+        if max_outer > 1:
+            log(f"\n⚠️ {max_outer} outer iterations exhausted with remaining failures")
+            log("Proceeding to Phase 9 with honest reporting of remaining gaps")
 
     def _run_inner_audit_loop(self, start_lemma: int = 1,
                               start_iteration: int = 1) -> bool:
@@ -1254,7 +1501,7 @@ class ProofOrchestrator:
 
         # 9b: cold read
         log("Phase 9b: Cold read audit")
-        output = self._invoke(PHASE_9B_COLD_READ)
+        output = self._invoke(format_prompt(PHASE_9B_COLD_READ))
         summary = parse_json_from_output(output)
         if summary:
             unresolved = summary.get("unresolved_critical", 0)
